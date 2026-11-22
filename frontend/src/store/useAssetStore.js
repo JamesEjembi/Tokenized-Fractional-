@@ -1,44 +1,37 @@
 import { create } from 'zustand';
+import { apiCacheService } from '../services/apiCacheService.js';
 
-/**
- * useAssetStore
- *
- * Global state for RWA asset metadata fetched from the backend API.
- * Not persisted — metadata is lightweight and always re-fetched
- * when a wallet connects, ensuring it stays fresh.
- */
 export const useAssetStore = create((set, get) => ({
-  // ── Single asset state ─────────────────────────────────
   assetMeta: null,
   isFetchingMeta: false,
   metaError: null,
 
-  // ── All assets listing state ────────────────────────────
   assets: [],
   isFetchingAssets: false,
   assetsError: null,
 
-  // ── Actions ────────────────────────────────────────────
+  // Cursor-based pagination state (Issue #513)
+  hasNextPage: false,
+  nextCursor: null,
+  totalCount: 0,
+  pageSize: 20,
 
-  /**
-   * Fetches RWA metadata from the backend API.
-   * Silently skips if the contractId is a placeholder.
-   *
-   * @param {string} contractId - The on-chain contract address
-   * @param {string} apiUrl     - Base URL of the metadata API
-   */
   fetchMetadata: async (contractId, apiUrl) => {
-    // Guard: skip placeholder / unconfigured contract IDs
     if (!contractId || contractId.length < 50) return;
-
-    // Avoid duplicate concurrent fetches
     if (get().isFetchingMeta) return;
 
     set({ isFetchingMeta: true, metaError: null });
     try {
-      const res = await fetch(`${apiUrl}/api/v1/rwa/${contractId}`);
+      const url = `${apiUrl}/api/v1/rwa/${contractId}`;
+      const cached = apiCacheService.get(url);
+      if (cached) {
+        set({ assetMeta: cached.data });
+        return;
+      }
+      const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
+        apiCacheService.set(url, data, null, 2 * 60 * 1000);
         set({ assetMeta: data });
       } else {
         console.warn('[AssetStore] Metadata endpoint returned', res.status);
@@ -46,45 +39,100 @@ export const useAssetStore = create((set, get) => ({
       }
     } catch (err) {
       console.warn('[AssetStore] Metadata server unreachable:', err.message);
-      // Non-fatal — app works fine without metadata
     } finally {
       set({ isFetchingMeta: false });
     }
   },
 
-  /**
-   * Fetches ALL RWA assets from GET /api/v1/rwa.
-   *
-   * @param {string} apiUrl - Base URL of the metadata API
-   */
+  /** Fetch all assets (legacy — replaces current list). */
   fetchAllAssets: async (apiUrl) => {
-    // Avoid duplicate concurrent fetches
     if (get().isFetchingAssets) return;
 
     set({ isFetchingAssets: true, assetsError: null });
     try {
-      const res = await fetch(`${apiUrl}/api/v1/rwa`);
+      const url = `${apiUrl}/api/v1/rwa`;
+      const cached = apiCacheService.get(url);
+      if (cached) {
+        const cachedAssets = cached.data.data || [];
+        set({
+          assets: cachedAssets,
+          totalCount: cached.data.pagination?.total || cachedAssets.length,
+          hasNextPage: cached.data.pagination?.hasNext ?? false,
+          nextCursor: cached.data.pagination?.nextCursor ?? null,
+        });
+        return;
+      }
+      const res = await fetch(url);
       if (res.ok) {
         const json = await res.json();
-        set({ assets: json.data || [] });
+        apiCacheService.set(url, json, null, 2 * 60 * 1000);
+        set({
+          assets: json.data || [],
+          totalCount: json.pagination?.total || (json.data || []).length,
+          hasNextPage: json.pagination?.hasNext ?? false,
+          nextCursor: json.pagination?.nextCursor ?? null,
+        });
       } else {
         console.warn('[AssetStore] Assets endpoint returned', res.status);
         set({ assetsError: `Unable to load assets (${res.status})` });
       }
     } catch (err) {
       console.warn('[AssetStore] Assets server unreachable:', err.message);
+      set({
+        assetsError: 'Unable to reach the metadata server. Please try again.',
+      });
+    } finally {
+      set({ isFetchingAssets: false });
+    }
+  },
+
+  /**
+   * Fetch next page of assets (cursor-based infinite scroll).
+   * Appends results to the existing list.
+   */
+  fetchNextPage: async (apiUrl) => {
+    const { isFetchingAssets, hasNextPage, nextCursor, pageSize } = get();
+    if (isFetchingAssets || !hasNextPage || !nextCursor) return;
+
+    set({ isFetchingAssets: true, assetsError: null });
+    try {
+      const url = `${apiUrl}/api/v1/rwa?limit=${pageSize}&after=${encodeURIComponent(nextCursor)}`;
+      const res = await fetch(url);
+      if (res.ok) {
+        const json = await res.json();
+        set((state) => ({
+          assets: [...state.assets, ...(json.data || [])],
+          hasNextPage: json.pagination?.hasNext ?? false,
+          nextCursor: json.pagination?.nextCursor ?? null,
+          totalCount: json.pagination?.total ?? state.totalCount,
+        }));
+      } else {
+        console.warn('[AssetStore] Next page returned', res.status);
+        set({ assetsError: `Unable to load more assets (${res.status})` });
+      }
+    } catch (err) {
+      console.warn('[AssetStore] Next page unreachable:', err.message);
       set({ assetsError: 'Unable to reach the metadata server. Please try again.' });
     } finally {
       set({ isFetchingAssets: false });
     }
   },
 
-  /** Clears asset metadata (e.g. on wallet disconnect). */
-  clearMeta: () => set({ assetMeta: null, metaError: null }),
+  clearMeta: () => {
+    apiCacheService.invalidate('/api/v1/rwa');
+    set({ assetMeta: null, metaError: null });
+  },
 
-  /** Clear metadata error. */
   clearMetaError: () => set({ metaError: null }),
 
-  /** Clear assets listing and error. */
-  clearAssets: () => set({ assets: [], assetsError: null }),
+  clearAssets: () => {
+    apiCacheService.invalidate('/api/v1/rwa');
+    set({
+      assets: [],
+      assetsError: null,
+      hasNextPage: false,
+      nextCursor: null,
+      totalCount: 0,
+    });
+  },
 }));

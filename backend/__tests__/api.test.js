@@ -5,12 +5,14 @@ process.env.DATA_FILE = 'test-data.json';
 
 import request from 'supertest';
 import { unlinkSync, existsSync } from 'fs';
-import crypto from 'crypto';
-import { app, tokenize, buildSearchIndex, scoreSearch } from '../index.js';
+import { app, rateLimiterService } from '../index.js';
 import { setClient } from '../cache.js';
 
 // Ensure Redis is disabled (null = graceful fallback) for these tests
-beforeAll(() => setClient(null));
+beforeAll(() => {
+  setClient(null);
+  rateLimiterService.configureApiKey('test-key-for-jest', 'enterprise');
+});
 afterAll(() => setClient(null));
 
 const API_KEY = 'test-key-for-jest';
@@ -52,6 +54,12 @@ describe('X-Request-ID', () => {
     const id = '12345678-1234-1234-1234-123456789abc';
     const res = await request(app).get('/health').set('X-Request-ID', id);
     expect(res.headers['x-request-id']).toBe(id);
+  });
+
+  test('does not echo an invalid X-Request-ID', async () => {
+    const res = await request(app).get('/health').set('X-Request-ID', 'contains spaces');
+    expect(res.headers['x-request-id']).not.toBe('contains spaces');
+    expect(res.headers['x-request-id']).toMatch(/^req_[0-9a-f-]{36}$/);
   });
 
   test('404 response body includes requestId', async () => {
@@ -113,9 +121,35 @@ describe('GET /api/rwa', () => {
     expect(Array.isArray(res.body.data)).toBe(true);
     expect(res.body.pagination).toBeDefined();
     expect(res.body.pagination.total).toBeGreaterThanOrEqual(2);
-    expect(res.body.pagination.page).toBe(1);
     expect(res.body.pagination.limit).toBe(20);
-    expect(res.body.pagination.totalPages).toBeGreaterThanOrEqual(1);
+    expect(typeof res.body.pagination.hasNext).toBe('boolean');
+    expect(typeof res.body.pagination.hasPrev).toBe('boolean');
+  });
+
+  test('returns relative image and document paths through configured CDN', async () => {
+    const previousAssetCdnUrl = process.env.ASSET_CDN_URL;
+    process.env.ASSET_CDN_URL = 'https://assets.example.com';
+    const contractId = 'C' + 'D'.repeat(55);
+
+    try {
+      await createAndApproveAsset({
+        contractId,
+        title: 'CDN Enabled Asset',
+        location: 'Singapore',
+        description: 'Asset with relative media paths',
+        assetType: 'Real Estate',
+        imageUrl: '/uploads/cdn-asset.jpg',
+        documents: ['/documents/deed.pdf'],
+      });
+
+      const res = await request(app).get(`/api/rwa/${contractId}`);
+      expect(res.status).toBe(200);
+      expect(res.body.imageUrl).toBe('https://assets.example.com/uploads/cdn-asset.jpg');
+      expect(res.body.documents).toEqual(['https://assets.example.com/documents/deed.pdf']);
+    } finally {
+      if (previousAssetCdnUrl === undefined) delete process.env.ASSET_CDN_URL;
+      else process.env.ASSET_CDN_URL = previousAssetCdnUrl;
+    }
   });
 
   test('filters by assetType', async () => {
@@ -137,30 +171,43 @@ describe('GET /api/rwa', () => {
   });
 
   test('paginates with limit=1', async () => {
-    const res = await request(app).get('/api/rwa?limit=1&page=1');
+    const res = await request(app).get('/api/rwa?limit=1');
     expect(res.status).toBe(200);
     expect(res.body.data.length).toBe(1);
     expect(res.body.pagination.limit).toBe(1);
-    expect(res.body.pagination.page).toBe(1);
   });
 
-  test('page 2 with limit=1 returns next item', async () => {
-    const page1 = await request(app).get('/api/rwa?limit=1&page=1');
-    const page2 = await request(app).get('/api/rwa?limit=1&page=2');
+  test('cursor pagination returns different items on next page', async () => {
+    const page1 = await request(app).get('/api/rwa?limit=1');
+    const page2 = await request(app).get(`/api/rwa?limit=1&after=${page1.body.pagination.nextCursor}`);
     expect(page1.body.data[0].contractId).not.toBe(page2.body.data[0].contractId);
   });
 });
 
 // ── POST /api/rwa ─────────────────────────────────────────────────────────────
 describe('POST /api/rwa', () => {
+  // Issue #706: POST is create-only, so use a contractId that is not created
+  // elsewhere in this suite and assert the duplicate-ID conflict explicitly.
+  const CREATE_ID = 'C' + 'P'.repeat(55);
+
   test('creates asset with valid key and body', async () => {
     const res = await request(app)
       .post('/api/rwa')
       .set('x-api-key', API_KEY)
-      .send(VALID_BODY);
+      .send({ ...VALID_BODY, contractId: CREATE_ID });
     expect(res.status).toBe(201);
-    expect(res.body.contractId).toBe(VALID_ID);
+    expect(res.body.contractId).toBe(CREATE_ID);
     expect(res.body.title).toBe('Test Property');
+  });
+
+  test('returns 409 Conflict for a duplicate contractId', async () => {
+    const res = await request(app)
+      .post('/api/rwa')
+      .set('x-api-key', API_KEY)
+      .send({ ...VALID_BODY, contractId: CREATE_ID, title: 'Overwrite Attempt' });
+    expect(res.status).toBe(409);
+    expect(res.body.detail).toMatch(/already exists/i);
+    expect(res.body.code).toBe('ASSET_ALREADY_EXISTS');
   });
 
   test('rejects missing API key', async () => {
@@ -360,16 +407,68 @@ describe('GET /api/v1/rwa', () => {
   });
 });
 
+// ── Sitemap ──────────────────────────────────────────────────────────────────
+describe('GET /sitemap.xml', () => {
+  const approvedId = 'C' + 'S'.repeat(55);
+  const rejectedId = 'C' + 'R'.repeat(55);
+
+  beforeAll(async () => {
+    await createAndApproveAsset({
+      contractId: approvedId,
+      title: 'Public Asset <One>',
+      location: 'London',
+      description: 'Public listing',
+      assetType: 'Real Estate',
+    });
+    await request(app)
+      .post('/api/rwa')
+      .set('x-api-key', API_KEY)
+      .send({
+        contractId: rejectedId,
+        title: 'Private Asset',
+        location: 'London',
+        description: 'Unpublished listing',
+        assetType: 'Real Estate',
+      });
+  });
+
+  test('returns an escaped daily sitemap for approved assets only', async () => {
+    const res = await request(app).get('/sitemap.xml');
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toMatch(/application\/xml/);
+    expect(res.headers['cache-control']).toContain('max-age=86400');
+    expect(res.text).toContain('<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">');
+    expect(res.text).toContain(`/asset/${approvedId}`);
+    expect(res.text).not.toContain(rejectedId);
+    expect(res.text).not.toContain('Public Asset <One>');
+    expect(res.text).toContain('Public Asset &lt;One&gt;');
+  });
+});
+
 // ── Versioned routes: POST /api/v1/rwa ────────────────────────────────────────
 describe('POST /api/v1/rwa', () => {
+  // Issue #706: create-only — distinct id for the happy path, plus the
+  // duplicate-ID conflict on the versioned prefix.
+  const CREATE_ID = 'C' + 'Q'.repeat(55);
+
   test('creates asset with valid key and body', async () => {
     const res = await request(app)
       .post('/api/v1/rwa')
       .set('x-api-key', API_KEY)
-      .send(VALID_BODY);
+      .send({ ...VALID_BODY, contractId: CREATE_ID });
     expect(res.status).toBe(201);
-    expect(res.body.contractId).toBe(VALID_ID);
+    expect(res.body.contractId).toBe(CREATE_ID);
     expect(res.body.title).toBe('Test Property');
+  });
+
+  test('returns 409 Conflict for a duplicate contractId', async () => {
+    const res = await request(app)
+      .post('/api/v1/rwa')
+      .set('x-api-key', API_KEY)
+      .send({ ...VALID_BODY, contractId: CREATE_ID });
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('ASSET_ALREADY_EXISTS');
   });
 
   test('rejects missing API key', async () => {
@@ -1016,15 +1115,21 @@ describe('Webhook Management', () => {
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 describe('Rate limiting', () => {
-  test('write requests succeed within test-mode limit (max: 1000)', async () => {
-    const ids = Array.from({ length: 25 }, (_, i) =>
+  const LIMITED_KEY = 'test-rate-limited-key';
+
+  beforeAll(() => {
+    rateLimiterService.configureApiKey(LIMITED_KEY, 'free');
+  });
+
+  test('write limiter blocks after rate limit exceeded', async () => {
+    const ids = Array.from({ length: 101 }, (_, i) =>
       'C' + String(i).padStart(55, '0')
     );
     const statuses = [];
     for (const id of ids) {
       const res = await request(app)
         .post('/api/rwa')
-        .set('x-api-key', API_KEY)
+        .set('x-api-key', LIMITED_KEY)
         .send({ ...VALID_BODY, contractId: id });
       statuses.push(res.status);
     }

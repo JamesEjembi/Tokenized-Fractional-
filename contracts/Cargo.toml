@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "nft"]
+members = [".", "nft", "multi_asset"]
 resolver = "2"
 
 [package]
